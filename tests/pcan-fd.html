@@ -1,0 +1,47 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>PCAN-USB Pro FD: read-only probe</title>
+<style>body{font:14px system-ui;margin:2em;max-width:60em}pre{background:#eee;padding:1em;white-space:pre-wrap}</style>
+<h1>PCAN-USB Pro FD probe</h1>
+<p>Reads descriptors and the firmware info record (vendor request 0, value 1). Sends nothing that changes device state.
+Protocol source: Linux <code>drivers/net/can/usb/peak_usb/pcan_usb_fd.c</code>.</p>
+<button id="go">Connect, open, read</button>
+<pre id="out"></pre>
+<script>
+const out = document.getElementById("out");
+const log = (...a) => out.textContent += a.join(" ") + "\n";
+const hex = (n, w) => "0x" + n.toString(16).padStart(w, "0");
+
+// struct pcan_ufd_fw_info (packed, little-endian), 36 bytes
+function parseFwInfo(v) {
+  const u8 = (o) => v.getUint8(o);
+  const info = {
+    size_of: v.getUint16(0, true), type: v.getUint16(2, true), hw_type: u8(4),
+    bl_version: [u8(5), u8(6), u8(7)].join("."), hw_version: u8(8), fw_version: [u8(9), u8(10), u8(11)].join("."),
+    dev_id: [hex(v.getUint32(12, true), 8), hex(v.getUint32(16, true), 8)], serial: v.getUint32(20, true), flags: hex(v.getUint32(24, true), 8),
+  };
+  // type >= 2 carries endpoint numbers; otherwise the driver defaults apply (cmd 1/0x81, rx 0x82, tx 2 and 3)
+  if (info.type >= 2 && v.byteLength >= 36) Object.assign(info, { cmd_out_ep: u8(28), cmd_in_ep: u8(29), data_out_ep: [u8(30), u8(31)], data_in_ep: u8(32) });
+  return info;
+}
+
+document.getElementById("go").onclick = async () => {
+  out.textContent = "";
+  try {
+    if (!navigator.usb) return log("navigator.usb missing: enable the extension for this site and reload.");
+    const d = await navigator.usb.requestDevice({ filters: [{ vendorId: 0x0c72, productId: 0x0011 }] });
+    log("Device:", d.productName, "serial", d.serialNumber, "USB", d.usbVersionMajor + "." + d.usbVersionMinor);
+    await d.open();
+    if (!d.configuration) await d.selectConfiguration(1);
+    for (const i of d.configuration.interfaces) for (const a of i.alternates) {
+      log(`Interface ${i.interfaceNumber} alt ${a.alternateSetting} class ${hex(a.interfaceClass, 2)}`);
+      for (const e of a.endpoints) log(`  endpoint ${e.endpointNumber} ${e.direction} ${e.type} max ${e.packetSize}`);
+    }
+    // requestType vendor, recipient other, request 0 (REQ_INFO), value 1 (INFO_FW), index 0
+    const r = await d.controlTransferIn({ requestType: "vendor", recipient: "other", request: 0, value: 1, index: 0 }, 36);
+    log("Control status:", r.status, "bytes:", r.data ? r.data.byteLength : 0);
+    if (r.status === "ok" && r.data.byteLength >= 28) log(JSON.stringify(parseFwInfo(r.data), null, 2));
+    await d.close();
+  } catch (e) { log("Error:", e.name, e.message); }
+};
+</script>

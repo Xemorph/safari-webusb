@@ -1,6 +1,10 @@
 #import "USBBackend.h"
 #import "PermissionIdentity.h"
+#if TARGET_OS_IOS
+#import "libusb_dext.h" // iPadOS: dext-backed subset, see ipados/
+#else
 #import <libusb.h>
+#endif
 #import <math.h>
 #import <time.h>
 
@@ -63,6 +67,10 @@ static BOOL USBOriginAllowed(NSString *origin) {
 @property(nonatomic) NSInteger configuration;
 @property(nonatomic) NSMutableSet<NSNumber *> *claimed;
 @property(nonatomic) NSMutableDictionary<NSNumber *, NSNumber *> *alternates;
+/// Bulk/interrupt transfers run off the USB queue; closing the handle waits on this group.
+@property(nonatomic) dispatch_group_t inflight;
+/// One serial queue per endpoint address keeps same-endpoint order while different endpoints overlap.
+@property(nonatomic) NSMutableDictionary<NSNumber *, dispatch_queue_t> *endpointQueues;
 @end
 @implementation USBOpenDevice
 - (void)dealloc { if (_handle) libusb_close(_handle); }
@@ -77,7 +85,17 @@ static BOOL USBOriginAllowed(NSString *origin) {
 @implementation USBSession
 @end
 
+/// Returned by processMessage when a transfer owns the completion and will answer later.
+static NSDictionary *USBDeferredResponse(void) {
+    static NSDictionary *marker;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ marker = @{@"deferred": @YES}; });
+    return marker;
+}
+
 @interface USBBackend ()
+/// Set only while the USB queue runs one asynchronous request; consumed by a transfer.
+@property(nonatomic, copy) void (^deferredCompletion)(NSDictionary *response);
 @property(nonatomic) libusb_context *context;
 @property(nonatomic) int initializationError;
 @property(nonatomic, copy, readwrite) NSString *instance;
@@ -147,6 +165,8 @@ static BOOL USBOriginAllowed(NSString *origin) {
 - (void)closeDevice:(NSString *)identifier session:(USBSession *)session {
     USBOpenDevice *opened = session.opened[identifier];
     if (opened) {
+        // A synchronous libusb transfer cannot be cancelled; it ends within USBTransferTimeout.
+        if (opened.inflight) dispatch_group_wait(opened.inflight, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(USBTransferTimeout + 2000) * NSEC_PER_MSEC));
         for (NSNumber *number in opened.claimed) libusb_release_interface(opened.handle, number.intValue);
         [opened.claimed removeAllObjects];
         if (opened.handle) { libusb_close(opened.handle); opened.handle = NULL; }
@@ -366,7 +386,12 @@ static BOOL USBOriginAllowed(NSString *origin) {
 - (void)handleMessage:(id)message profile:(NSString *)profile completion:(void (^)(NSDictionary *))completion {
     NSTimeInterval requestedAt = USBNow();
     dispatch_async(self.queue, ^{
-        @autoreleasepool { completion([self admitMessage:message profile:profile requestedAt:requestedAt]); }
+        @autoreleasepool {
+            self.deferredCompletion = completion;
+            NSDictionary *response = [self admitMessage:message profile:profile requestedAt:requestedAt];
+            self.deferredCompletion = nil;
+            if (response != USBDeferredResponse()) completion(response);
+        }
     });
 }
 
@@ -467,6 +492,8 @@ static BOOL USBOriginAllowed(NSString *origin) {
         opened.configuration = configuration;
         opened.claimed = [NSMutableSet set];
         opened.alternates = [NSMutableDictionary dictionary];
+        opened.inflight = dispatch_group_create();
+        opened.endpointQueues = [NSMutableDictionary dictionary];
         session.opened[deviceId] = opened;
         self.owners[deviceId] = key;
         return [self success:[self snapshot:record session:session]];
@@ -596,18 +623,40 @@ static BOOL USBOriginAllowed(NSString *origin) {
         buffer = [data mutableCopy];
         if (!length) [buffer setLength:1];
     }
-    int transferred = 0;
-    int result = type == LIBUSB_TRANSFER_TYPE_BULK
-        ? libusb_bulk_transfer(opened.handle, address, buffer.mutableBytes, (int)length, &transferred, USBTransferTimeout)
-        : libusb_interrupt_transfer(opened.handle, address, buffer.mutableBytes, (int)length, &transferred, USBTransferTimeout);
-    if (result < 0 && result != LIBUSB_ERROR_PIPE) return [self usbFailure:result action:@"USB transfer"];
-    if (transferred < 0 || (NSUInteger)transferred > length) return [self failure:@"NetworkError" message:@"USB driver returned an invalid transfer length."];
-    NSString *status = result == LIBUSB_ERROR_PIPE ? @"stall" : @"ok";
-    if (input) {
-        [buffer setLength:(NSUInteger)transferred];
-        return [self success:@{@"status": status, @"data": [buffer base64EncodedStringWithOptions:0]}];
+    // Only values captured here are used off the queue: the config descriptor is freed when this returns.
+    libusb_device_handle *handle = opened.handle;
+    NSDictionary *(^perform)(void) = ^NSDictionary *{
+        int transferred = 0;
+        int result = type == LIBUSB_TRANSFER_TYPE_BULK
+            ? libusb_bulk_transfer(handle, address, buffer.mutableBytes, (int)length, &transferred, USBTransferTimeout)
+            : libusb_interrupt_transfer(handle, address, buffer.mutableBytes, (int)length, &transferred, USBTransferTimeout);
+        if (result < 0 && result != LIBUSB_ERROR_PIPE) return [self usbFailure:result action:@"USB transfer"];
+        if (transferred < 0 || (NSUInteger)transferred > length) return [self failure:@"NetworkError" message:@"USB driver returned an invalid transfer length."];
+        NSString *status = result == LIBUSB_ERROR_PIPE ? @"stall" : @"ok";
+        if (input) {
+            [buffer setLength:(NSUInteger)transferred];
+            return [self success:@{@"status": status, @"data": [buffer base64EncodedStringWithOptions:0]}];
+        }
+        return [self success:@{@"status": status, @"bytesWritten": @(transferred)}];
+    };
+    void (^done)(NSDictionary *) = self.deferredCompletion;
+    if (!done) return perform(); // synchronous callers (tests) keep the blocking behavior
+    self.deferredCompletion = nil;
+    NSNumber *queueKey = @(address);
+    dispatch_queue_t endpointQueue = opened.endpointQueues[queueKey];
+    if (!endpointQueue) {
+        endpointQueue = dispatch_queue_create("org.webusb.safari.native.usb.endpoint", DISPATCH_QUEUE_SERIAL);
+        opened.endpointQueues[queueKey] = endpointQueue;
     }
-    return [self success:@{@"status": status, @"bytesWritten": @(transferred)}];
+    dispatch_group_t inflight = opened.inflight;
+    dispatch_group_enter(inflight);
+    dispatch_async(endpointQueue, ^{
+        NSDictionary *response;
+        @autoreleasepool { response = perform(); }
+        dispatch_group_leave(inflight);
+        dispatch_async(self.queue, ^{ done(response); });
+    });
+    return USBDeferredResponse();
 }
 
 - (NSDictionary *)controlTransfer:(NSString *)op args:(NSDictionary *)args opened:(USBOpenDevice *)opened configuration:(struct libusb_config_descriptor *)configuration {

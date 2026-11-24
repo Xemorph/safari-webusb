@@ -1,0 +1,23 @@
+name: iPadOS compile check
+
+# Syntax-checks the dext-backed libusb subset and USBBackend.m against the iPhoneOS SDK. No signing, no hardware.
+on:
+  push:
+    paths: ['ipados/**', 'native/USBBackend.m', '.github/workflows/ipados-compile.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compile:
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Compile libusb_dext.c for iPadOS
+        run: xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=17.0 -Wall -Wextra -fsyntax-only -Iipados ipados/libusb_dext.c
+      - name: Compile USBBackend.m against libusb_dext.h
+        run: xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=17.0 -fobjc-arc -Wall -Wextra -fsyntax-only -Iipados -Inative native/USBBackend.m

@@ -96,9 +96,12 @@
   // On macOS 27 / Safari 27, rapid native-message bursts fail after about 150
   // replies; 40 ms pacing is an empirical workaround, not a documented quota.
   // Bound and pace all callers together; a rejected native call is never replayed.
+  // Bulk/interrupt transfers may overlap each other (a pending read must not stall writes) on the persistent
+  // socket. Every other operation still runs alone, and none starts while another non-transfer is running.
+  const CONCURRENT_OPS = new Set(["transferIn", "transferOut"]);
   function createNativeScheduler({timers = root, now = () => root.performance.now(), minimumGap = 40, maxPending = 128, admissionTimeout = 10000} = {}) {
     const queue = [];
-    let active = false, lastStart = -Infinity, wakeup = null;
+    let active = false, running = 0, lastStart = -Infinity, wakeup = null;
     function pump() {
       if (wakeup !== null) { timers.clearTimeout(wakeup); wakeup = null; }
       const time = now();
@@ -115,14 +118,16 @@
       const entry = queue.shift();
       try { entry.validate(); }
       catch (error) { entry.reject(error); pump(); return; }
-      active = true;
+      const overlap = entry.concurrent && gap === 0; // the paced legacy path stays strictly serial
+      if (overlap) running++; else active = true;
       lastStart = time;
       let pending;
       try { pending = entry.run(); } catch (error) { pending = Promise.reject(error); }
       Promise.resolve(pending).then(entry.resolve, entry.reject).finally(() => {
-        active = false;
+        if (overlap) running--; else active = false;
         pump();
       });
+      if (overlap) pump(); // the next queued transfer may start right away
     }
     return {
       cancelPending(error, predicate = () => true) {
@@ -131,9 +136,9 @@
         pump();
       },
       schedule(run, validate = () => {}, metadata) {
-        if (queue.length + Number(active) >= maxPending) return Promise.reject(fail("QuotaExceededError", "Too many pending native USB requests."));
+        if (queue.length + Number(active) + running >= maxPending) return Promise.reject(fail("QuotaExceededError", "Too many pending native USB requests."));
         return new Promise((resolve, reject) => {
-          queue.push({run, validate, metadata, resolve, reject, deadline: now() + admissionTimeout});
+          queue.push({run, validate, metadata, resolve, reject, concurrent: CONCURRENT_OPS.has(metadata?.op), deadline: now() + admissionTimeout});
           pump();
         });
       }

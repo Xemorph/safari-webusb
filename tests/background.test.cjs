@@ -648,3 +648,30 @@ test("permission management canonicalizes Safari's uppercase extension UUID to t
   assert.equal(h.calls.length,1);
   assert.equal(h.calls[0].extensionManagement,true);
 });
+
+test("native scheduler lets transfers overlap on the persistent transport but keeps other calls exclusive", async () => {
+  const {scheduler} = schedulerHarness({minimumGap: 0});
+  const started = [], read = deferred(), claim = deferred();
+  const meta = op => ({op});
+  const a = scheduler.schedule(() => { started.push("read"); return read.promise; }, () => {}, meta("transferIn"));
+  const b = scheduler.schedule(() => { started.push("write"); return "w"; }, () => {}, meta("transferOut"));
+  await tick();
+  assert.deepEqual(started, ["read", "write"]); // a pending read does not stall the write
+  const c = scheduler.schedule(() => { started.push("claim"); return claim.promise; }, () => {}, meta("claimInterface"));
+  const d = scheduler.schedule(() => { started.push("late"); return "l"; }, () => {}, meta("transferOut"));
+  await tick();
+  assert.deepEqual(started, ["read", "write", "claim"]); // exclusive call runs; later transfer keeps FIFO order behind it
+  claim.resolve("c"); await tick();
+  assert.deepEqual(started, ["read", "write", "claim", "late"]);
+  read.resolve("r");
+  assert.deepEqual(await Promise.all([a, b, c, d]), ["r", "w", "c", "l"]);
+});
+test("native scheduler keeps transfers strictly serial on the paced legacy path", async () => {
+  const {clock, scheduler} = schedulerHarness({minimumGap: 40});
+  const started = [], read = deferred();
+  scheduler.schedule(() => { started.push("read"); return read.promise; }, () => {}, {op: "transferIn"});
+  scheduler.schedule(() => { started.push("write"); return "w"; }, () => {}, {op: "transferOut"});
+  await clock.advance(100);
+  assert.deepEqual(started, ["read"]);
+  read.resolve("r");
+});

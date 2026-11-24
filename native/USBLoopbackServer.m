@@ -71,6 +71,8 @@ static NSError *USBTransportError(NSString *description) {
 @property(nonatomic) NSMutableArray<USBLoopbackPeer *> *cleanupPeers;
 @property(nonatomic) NSMutableDictionary<NSString *, NSNumber *> *usedNonces;
 @property(nonatomic) USBLoopbackRequest *active;
+/// Bulk/interrupt transfers run beside `active` so a pending read does not stall writes.
+@property(nonatomic) NSMutableSet<USBLoopbackRequest *> *activeTransfers;
 @property(nonatomic) NSMutableSet<USBLoopbackRequest *> *aborts;
 @property(nonatomic) BOOL started;
 @property(nonatomic) BOOL stopping;
@@ -155,7 +157,7 @@ static NSError *USBTransportError(NSString *description) {
     if ((self = [super init])) {
         _queue = dispatch_queue_create("org.webtilp.safariwebusb.loopback", DISPATCH_QUEUE_SERIAL);
         dispatch_queue_set_specific(_queue, USBTransportQueueKey, (__bridge void *)self, NULL);
-        _peers = [NSMutableSet set]; _aborts = [NSMutableSet set]; _requests = [NSMutableArray array]; _closeRequests = [NSMutableArray array]; _cleanupPeers = [NSMutableArray array]; _usedNonces = [NSMutableDictionary dictionary];
+        _peers = [NSMutableSet set]; _aborts = [NSMutableSet set]; _activeTransfers = [NSMutableSet set]; _requests = [NSMutableArray array]; _closeRequests = [NSMutableArray array]; _cleanupPeers = [NSMutableArray array]; _usedNonces = [NSMutableDictionary dictionary];
     }
     return self;
 }
@@ -355,7 +357,7 @@ static NSError *USBTransportError(NSString *description) {
         if (!trustedManagement || !USBTransportString(sessionID, 16, 128)) {
             [self requestError:request name:@"SecurityError" message:@"Permission management requires the extension settings page."]; return;
         }
-        if (peer.pending.count >= USBMaximumPeerPending || self.requests.count + self.aborts.count + (self.active ? 1 : 0) >= USBMaximumPending) {
+        if (peer.pending.count >= USBMaximumPeerPending || self.requests.count + self.aborts.count + self.activeTransfers.count + (self.active ? 1 : 0) >= USBMaximumPending) {
             [self requestError:request name:@"QuotaExceededError" message:@"Too many pending device requests."]; return;
         }
         request.deadline = USBTransportNow() + USB_TRANSPORT_ADMISSION_SECONDS;
@@ -376,7 +378,7 @@ static NSError *USBTransportError(NSString *description) {
         [peer.pending addObject:identifier]; [self.closeRequests addObject:request]; [self pump];
         return;
     }
-    if (peer.pending.count >= USBMaximumPeerPending || self.requests.count + self.aborts.count + (self.active && !self.active.cleanup && !self.active.mandatory ? 1 : 0) >= USBMaximumPending) { [self requestError:request name:@"QuotaExceededError" message:@"Too many pending USB transport requests."]; return; }
+    if (peer.pending.count >= USBMaximumPeerPending || self.requests.count + self.aborts.count + self.activeTransfers.count + (self.active && !self.active.cleanup && !self.active.mandatory ? 1 : 0) >= USBMaximumPending) { [self requestError:request name:@"QuotaExceededError" message:@"Too many pending USB transport requests."]; return; }
     if ([op isEqual:@"serial.abortWrite"]) {
         id args = request.message[@"args"], version = request.message[@"version"];
         if (![args isKindOfClass:NSDictionary.class] || !USBTransportString(args[@"deviceId"], 1, 100) ||
@@ -444,11 +446,14 @@ static NSError *USBTransportError(NSString *description) {
         if (request.peer.closed || request.peer.closing || (request.session.closed && ![request.message[@"op"] isEqual:@"closeSession"])) { [self requestError:request name:@"AbortError" message:@"The USB document closed before the operation started."]; request = nil; }
     }
     if (!request) return;
-    self.active = request;
+    // Transfers keep their place in the FIFO and wait for any running request, but do not occupy `active`.
+    NSString *requestOp = request.message[@"op"];
+    BOOL transfer = !request.cleanup && !request.mandatory && ([requestOp isEqual:@"transferIn"] || [requestOp isEqual:@"transferOut"]);
+    if (transfer) [self.activeTransfers addObject:request]; else self.active = request;
     void (^completion)(NSDictionary *) = ^(NSDictionary *response) {
         dispatch_async(self.queue, ^{
             if (USBTransportString(response[@"instance"], 1, 128)) self.backendInstance = response[@"instance"];
-            self.active = nil;
+            if (transfer) [self.activeTransfers removeObject:request]; else self.active = nil;
             if ([request.message[@"op"] isEqual:@"closeSession"] && [response[@"ok"] boolValue]) request.session.cleaned = YES;
             if (!request.cleanup) {
                 [request.peer.pending removeObject:request.identifier];
@@ -461,5 +466,6 @@ static NSError *USBTransportError(NSString *description) {
         [[DeviceBridgeBackend sharedBackend] handlePermissionMessage:request.message permissionProfile:request.peer.permissionProfile completion:completion];
     else
         [[DeviceBridgeBackend sharedBackend] handleMessage:request.message profile:request.peer.profile permissionProfile:request.peer.permissionProfile completion:completion];
+    if (transfer) [self pump]; // the next queued transfer may start immediately
 }
 @end
